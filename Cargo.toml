@@ -1,0 +1,18 @@
+[package]
+name = "ramble-markdown"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+eframe = "0.35.0"
+# better_syntax_highlighting: 代码块语法高亮（syntect，纯 Rust 正则后端）
+# embedded_image: 支持 data:image/...;base64 内嵌图片（mermaid 渲染结果用此方式展示）
+egui_commonmark = { version = "0.24.0", features = [
+    "better_syntax_highlighting",
+    "embedded_image",
+] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+# 纯 Rust mermaid 渲染（关闭默认的 cli 特性，只保留 png 栅格化）
+mermaid-rs-renderer = { version = "0.3.1", default-features = false, features = ["png"] }
+rfd = "0.17.2"
