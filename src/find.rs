@@ -17,8 +17,14 @@ pub struct FindState {
     pub query: String,
     pub replacement: String,
     pub case_sensitive: bool,
+    /// 反向查找：回车 / 初始跳转向上（往文档开头方向）进行
+    pub backwards: bool,
     /// 当前选中的匹配序号（None = 尚未选中任何匹配）
     pub selected: Option<usize>,
+    /// 打开查找栏后，下一帧把焦点交给查找输入框
+    pub focus_input: bool,
+    /// 当前匹配的字符区间（编辑区据此画高亮；编辑器保持焦点时由 egui 自己画选区）
+    pub highlight: Option<(usize, usize)>,
     /// 尚未应用的跳转请求（等编辑器状态就绪后应用）
     pub pending_jump: Option<CharRange>,
 }
@@ -89,12 +95,16 @@ impl FindState {
     }
 
     /// 匹配进度文案，如 "3 / 12"；无匹配时为 "0 / 0"
+    #[cfg(test)]
     pub fn label(&self, text: &str) -> String {
-        let n = self.match_count(text);
+        Self::progress_label(self.selected, self.match_count(text))
+    }
+
+    fn progress_label(selected: Option<usize>, n: usize) -> String {
         if n == 0 {
             return "0 / 0".to_string();
         }
-        let cur = self.selected.map(|i| i + 1).unwrap_or(1).min(n);
+        let cur = selected.map(|i| i + 1).unwrap_or(1).min(n);
         format!("{cur} / {n}")
     }
 
@@ -103,6 +113,7 @@ impl FindState {
         let ms = self.matches(text);
         if ms.is_empty() {
             self.selected = None;
+            self.highlight = None;
             return;
         }
         // 尚未选中时从第一个匹配开始（避免首次「下一个」跳过第一个）
@@ -111,6 +122,7 @@ impl FindState {
             None => 0,
         };
         self.selected = Some(i);
+        self.highlight = Some(ms[i].char);
         self.pending_jump = Some(ms[i].char);
     }
 
@@ -119,6 +131,7 @@ impl FindState {
         let ms = self.matches(text);
         if ms.is_empty() {
             self.selected = None;
+            self.highlight = None;
             return;
         }
         let i = match self.selected {
@@ -126,16 +139,23 @@ impl FindState {
             None => 0,
         };
         self.selected = Some(i);
+        self.highlight = Some(ms[i].char);
         self.pending_jump = Some(ms[i].char);
     }
 
-    /// 第一次打开查找栏（或查询词变化）时定位到第一个匹配
+    /// 第一次打开查找栏（或查询词变化）时定位到第一个匹配；反向查找时定位到最后一个
     pub fn jump_first(&mut self, text: &str) {
         let ms = self.matches(text);
-        self.selected = if ms.is_empty() { None } else { Some(0) };
-        if let Some(m) = ms.first() {
-            self.pending_jump = Some(m.char);
-        }
+        let i = if ms.is_empty() {
+            None
+        } else if self.backwards {
+            Some(ms.len() - 1)
+        } else {
+            Some(0)
+        };
+        self.selected = i;
+        self.highlight = i.map(|i| ms[i].char);
+        self.pending_jump = i.map(|i| ms[i].char);
     }
 
     /// 替换当前匹配（并跳到下一个）
@@ -147,8 +167,8 @@ impl FindState {
         let i = self.selected.unwrap_or(0).min(ms.len() - 1);
         let (b0, b1) = ms[i].byte;
         text.replace_range(b0..b1, &self.replacement);
-        let after = text.clone();
-        self.find_next(&after);
+        // 直接在同一份文本上继续查找，避免替换时额外 clone 整篇文档
+        self.find_next(&text[..]);
     }
 
     /// 全部替换，返回替换次数
@@ -162,6 +182,7 @@ impl FindState {
             text.replace_range(m.byte.0..m.byte.1, &self.replacement);
         }
         self.selected = None;
+        self.highlight = None;
         self.pending_jump = None;
         ms.len()
     }
@@ -173,21 +194,29 @@ impl FindState {
         let mut do_prev = false;
         let mut do_replace = false;
         let mut do_replace_all = false;
+        // 本帧只扫描一次匹配；查询词或文本变化后再刷新
+        let mut count = self.match_count(text);
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("查找").small());
 
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
+                    .id(egui::Id::new("find-query"))
                     .desired_width(200.0)
                     .hint_text("输入要查找的内容"),
             );
+            if std::mem::take(&mut self.focus_input) {
+                resp.request_focus();
+            }
             if resp.changed() {
                 self.jump_first(text);
+                count = self.match_count(text);
             }
-            // 回车 = 下一个，Shift+回车 = 上一个；Esc 关闭
+            // 回车 = 沿当前方向查找，Shift+回车 = 反方向；Esc 关闭
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if ui.input(|i| i.modifiers.shift) {
+                let forward = !self.backwards;
+                if ui.input(|i| i.modifiers.shift) == forward {
                     do_prev = true;
                 } else {
                     do_next = true;
@@ -198,7 +227,7 @@ impl FindState {
             }
 
             ui.label(
-                egui::RichText::new(self.label(text))
+                egui::RichText::new(Self::progress_label(self.selected, count))
                     .small()
                     .color(ui.visuals().weak_text_color()),
             );
@@ -215,6 +244,7 @@ impl FindState {
                 ui.label(egui::RichText::new("替换为").small());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.replacement)
+                        .id(egui::Id::new("find-replace"))
                         .desired_width(160.0)
                         .hint_text("替换内容"),
                 );
@@ -229,12 +259,18 @@ impl FindState {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").clicked() {
-                    self.close();
-                }
                 let mut cs = self.case_sensitive;
                 if ui.checkbox(&mut cs, "区分大小写").changed() {
                     self.case_sensitive = cs;
+                    self.jump_first(text);
+                }
+                let mut bw = self.backwards;
+                if ui
+                    .checkbox(&mut bw, "反向")
+                    .on_hover_text("向上查找：回车跳到上一个匹配")
+                    .changed()
+                {
+                    self.backwards = bw;
                     self.jump_first(text);
                 }
             });
@@ -256,9 +292,12 @@ impl FindState {
                 changed = true;
             }
         }
+        if changed {
+            count = self.match_count(text);
+        }
 
         // 无匹配时提示
-        if !self.query.is_empty() && self.match_count(text) == 0 {
+        if !self.query.is_empty() && count == 0 {
             ui.label(
                 egui::RichText::new("没有找到匹配项")
                     .small()
@@ -272,8 +311,10 @@ impl FindState {
     pub fn close(&mut self) {
         self.open = false;
         self.replace_visible = false;
+        self.focus_input = false;
         self.pending_jump = None;
         self.selected = None;
+        self.highlight = None;
     }
 }
 
@@ -362,6 +403,19 @@ mod tests {
     fn empty_query_matches_nothing() {
         let f = st("", false);
         assert_eq!(f.match_count("anything"), 0);
+    }
+
+    #[test]
+    fn backwards_jump_starts_from_last_match() {
+        let text = "x y x y x";
+        let mut f = st("x", false);
+        f.backwards = true;
+        f.jump_first(text);
+        // 反向查找的初始跳转应落在最后一个匹配上
+        assert_eq!(f.selected, Some(2));
+        // 之后「上一个」继续向文档开头方向移动
+        f.find_prev(text);
+        assert_eq!(f.selected, Some(1));
     }
 
     #[test]
